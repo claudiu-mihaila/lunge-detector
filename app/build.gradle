@@ -67,7 +67,4 @@ dependencies {
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
 
     implementation 'com.google.mediapipe:tasks-vision:0.10.15'
-
-    implementation 'org.projectlombok:lombok:1.18.34'
-    annotationProcessor 'org.projectlombok:lombok:1.18.34'
 }

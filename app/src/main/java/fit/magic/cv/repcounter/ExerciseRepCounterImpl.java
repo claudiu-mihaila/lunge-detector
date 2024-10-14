@@ -4,12 +4,13 @@ import androidx.annotation.NonNull;
 
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 import java.util.stream.Collectors;
 
 import fit.magic.cv.PoseLandmarkerHelper;
-import lombok.Getter;
 
 public class ExerciseRepCounterImpl extends ExerciseRepCounter {
 
@@ -19,7 +20,6 @@ public class ExerciseRepCounterImpl extends ExerciseRepCounter {
         LUNGE_UP,
     }
 
-    @Getter
     enum Landmark {
         RIGHT_HIP(24),
         LEFT_HIP(23),
@@ -33,17 +33,23 @@ public class ExerciseRepCounterImpl extends ExerciseRepCounter {
         Landmark(int code) {
             this.code = code;
         }
+
+        public int getCode() {
+            return code;
+        }
     }
 
-    private static final float HIP_HEIGHT_DIFF_THRESHOLD = 0.1f;  // Difference in hip height
-    private static final float LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES = 100.0f; // Lunging knee angle threshold
+    private static final float LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES = 80.0f; // Lunging knee angle threshold
     private static final float STANDING_KNEE_ANGLE_THRESHOLD_DEGREES = 170.0f; // Standing knee angle threshold
     private static final float STANDING_KNEE_ANGLE_DEGREES = 180.0f; // Standing knee angle
+    private static LungeState currentState = LungeState.STANDING;
+    private static final Queue<LungeFeatures> lastLungeFeatures = new ArrayDeque<>(10);
 
     @Override
     public void setResults(@NonNull PoseLandmarkerHelper.ResultBundle resultBundle) {
         // extract the features of lunges
         List<LungeFeatures> lungeFeatures = resultBundle.getResults().stream()
+                .filter(poseLandmarkerResult -> !poseLandmarkerResult.landmarks().isEmpty())
                 .map(poseLandmarkerResult -> extractLungeFeatures(poseLandmarkerResult.landmarks().get(0)))
                 .collect(Collectors.toList());
 
@@ -56,31 +62,30 @@ public class ExerciseRepCounterImpl extends ExerciseRepCounter {
     }
 
     private void detectLunges(List<LungeFeatures> smoothedFeatures) {
-        LungeState currentState = LungeState.STANDING;
-
-        double minLungeLeftKneeAngle = smoothedFeatures.stream().mapToDouble(LungeFeatures::getLeftKneeAngle).min().orElse(0.0);
-        double minLungeRightKneeAngle = smoothedFeatures.stream().mapToDouble(LungeFeatures::getRightKneeAngle).min().orElse(0.0);
-        double targetLungeKneeAngle = Math.min(minLungeLeftKneeAngle, minLungeRightKneeAngle);
-
         for (LungeFeatures features : smoothedFeatures) {
             switch (currentState) {
                 case STANDING:
-                    if (isLegAngleLow(features.getLeftKneeAngle(), features.getRightKneeAngle())
-                            && isHipHeightDiffSignificant(features.getHipHeightDiff())) {
+                    float downProgress = (float) (Math.max(features.getLeftKneeAngle(), features.getRightKneeAngle()) / (STANDING_KNEE_ANGLE_DEGREES - LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES));
+                    if (downProgress > 1f) {
+                        downProgress = 1.0f;
+                    }
+                    sendProgressUpdate(downProgress);
+                    if (isLegAngleLow(features.getLeftKneeAngle(), features.getRightKneeAngle())) {
                         currentState = LungeState.LUNGE_DOWN;
                     }
-                    float downProgress = (float) (STANDING_KNEE_ANGLE_DEGREES - Math.min(features.getLeftKneeAngle(), features.getRightKneeAngle()) / (STANDING_KNEE_ANGLE_DEGREES - targetLungeKneeAngle));
-                    sendProgressUpdate(downProgress);
                     break;
                 case LUNGE_DOWN:
+                    float upProgress = (float) (Math.max(features.getLeftKneeAngle(), features.getRightKneeAngle()) / (STANDING_KNEE_ANGLE_DEGREES - LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES));
+                    if (upProgress < 0f) {
+                        upProgress = 0.0f;
+                    }
+                    sendProgressUpdate(upProgress);
                     if (isLegAngleHigh(features.getLeftKneeAngle(), features.getRightKneeAngle())) {
                         currentState = LungeState.LUNGE_UP;
                     }
-                    float upProgress = 1.0f - (float) (STANDING_KNEE_ANGLE_DEGREES - Math.min(features.getLeftKneeAngle(), features.getRightKneeAngle()) / (STANDING_KNEE_ANGLE_DEGREES - targetLungeKneeAngle));
-                    sendProgressUpdate(upProgress);
                     break;
                 case LUNGE_UP:
-                    if (isLegAngleHigh(features.getLeftKneeAngle(), features.getRightKneeAngle()) && !isHipHeightDiffSignificant(features.getHipHeightDiff())) { //Add a check to avoid counting rep immediately after LUNGE_UP
+                    if (isLegAngleHigh(features.getLeftKneeAngle(), features.getRightKneeAngle())) { //Add a check to avoid counting rep immediately after LUNGE_UP
                         currentState = LungeState.STANDING;
                         incrementRepCount();
                     }
@@ -90,45 +95,35 @@ public class ExerciseRepCounterImpl extends ExerciseRepCounter {
     }
 
     private boolean isLegAngleHigh(double leftKneeAngle, double rightKneeAngle) {
-        return leftKneeAngle > STANDING_KNEE_ANGLE_THRESHOLD_DEGREES || rightKneeAngle > STANDING_KNEE_ANGLE_THRESHOLD_DEGREES;
+        return leftKneeAngle < STANDING_KNEE_ANGLE_DEGREES - STANDING_KNEE_ANGLE_THRESHOLD_DEGREES || rightKneeAngle < STANDING_KNEE_ANGLE_DEGREES - STANDING_KNEE_ANGLE_THRESHOLD_DEGREES;
     }
 
     private boolean isLegAngleLow(double leftKneeAngle, double rightKneeAngle) {
-        return leftKneeAngle < LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES || rightKneeAngle < LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES;
-    }
-
-    private boolean isHipHeightDiffSignificant(double hipHeightDiff) {
-        return hipHeightDiff > HIP_HEIGHT_DIFF_THRESHOLD;
+        return leftKneeAngle > LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES || rightKneeAngle > LUNGING_KNEE_ANGLE_THRESHOLD_DEGREES;
     }
 
     @NonNull
     private List<LungeFeatures> movingAverage(@NonNull List<LungeFeatures> features,
                                               int windowSize) {
-        if (features.size() < windowSize) {
-            return features;
+        lastLungeFeatures.addAll(features);
+        while (lastLungeFeatures.size() > windowSize) {
+            lastLungeFeatures.poll();
         }
 
         List<LungeFeatures> result = new ArrayList<>();
 
-        for (int i = 0; i < features.size() - windowSize; i++) {
-            double hipHeightDiffAvg = features.subList(i, i + windowSize).stream()
-                    .mapToDouble(LungeFeatures::getHipHeightDiff)
-                    .average().orElse(0.0);
-            double leftKneeAngleAvg = features.subList(i, i + windowSize).stream()
-                    .mapToDouble(LungeFeatures::getLeftKneeAngle)
-                    .average().orElse(0.0);
-            double rightKneeAngleAvg = features.subList(i, i + windowSize).stream()
-                    .mapToDouble(LungeFeatures::getRightKneeAngle)
-                    .average().orElse(0.0);
+        double hipHeightDiffAvg = lastLungeFeatures.stream()
+                .mapToDouble(LungeFeatures::getHipHeightDiff)
+                .average().orElse(0.0);
+        double leftKneeAngleAvg = lastLungeFeatures.stream()
+                .mapToDouble(LungeFeatures::getLeftKneeAngle)
+                .average().orElse(0.0);
+        double rightKneeAngleAvg = lastLungeFeatures.stream()
+                .mapToDouble(LungeFeatures::getRightKneeAngle)
+                .average().orElse(0.0);
 
-            LungeFeatures smoothedFeatures = LungeFeatures.builder()
-                    .hipHeightDiff(hipHeightDiffAvg)
-                    .leftKneeAngle(leftKneeAngleAvg)
-                    .rightKneeAngle(rightKneeAngleAvg)
-                    .build();
-
-            result.add(smoothedFeatures);
-        }
+        LungeFeatures smoothedFeatures = new LungeFeatures(hipHeightDiffAvg, leftKneeAngleAvg, rightKneeAngleAvg);
+        result.add(smoothedFeatures);
 
         return result;
     }
@@ -148,11 +143,7 @@ public class ExerciseRepCounterImpl extends ExerciseRepCounter {
         // Calculate hip height difference
         double hipHeightDiff = Math.abs(leftHip.y() - rightHip.y());
 
-        return LungeFeatures.builder()
-                .hipHeightDiff(hipHeightDiff)
-                .leftKneeAngle(leftKneeAngle)
-                .rightKneeAngle(rightKneeAngle)
-                .build();
+        return new LungeFeatures(hipHeightDiff, leftKneeAngle, rightKneeAngle);
     }
 
     // calculate the angle between 3 points
